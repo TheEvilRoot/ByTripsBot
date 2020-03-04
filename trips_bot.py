@@ -1,153 +1,224 @@
 #!/usr/bin/env python3
+import time
+from datetime import datetime, timedelta
+from os import environ as env
 
 import telebot
-from telebot import types
-from telebot.types import KeyboardButton as KB
-from telebot.types import ReplyKeyboardMarkup as KM
-from os import environ as env
-from datetime import date, time, datetime, timedelta
+from telebot.types import KeyboardButton as Kb
+from telebot.types import ReplyKeyboardMarkup as Km
 
-from req import Req
 from i18n import default as ldef
+from build import Build
+from req import Req
+from trip import Trip, VariantCompareResult
 
-class Build(object):
+from threading import Thread
 
-	def __init__(self, date=None, cfrom=None, dist=None):
-		self.date = date
-		self.cfrom = cfrom
-		self.dist = dist
-	
-	def req(u): 
-		return Req(u, self.date, self.cfrom, self.dist) 
+import requests as rq
 
 TOKEN = env["TOKEN"]
 
 bot = telebot.TeleBot(TOKEN)
 
+update_thread = None
+
 requests = {}
 builds = {}
 
-cities_markup = KM()
-cities_markup.add(KB('Минск'), KB('Витебск'), KB('Могилев'), KB('Брест'), KB('Гродно'), KB('Гомель'))
+available_endpoints = [ldef["name.mogilev"], ldef["name.minsk"]]
 
-dates_markup = KM()
-dates_markup.add(KB('Today'), KB('Tomorrow'))
+origins_markup = Km()
+origins_markup.add(*[Kb(f) for f in available_endpoints])
 
-confirm_markup = KM()
-confirm_markup.add(KB('Confirm'), KB('Date'), KB('From'), KB('To'))
+dates_markup = Km()
+dates_markup.add(Kb(ldef["name.today"]), Kb(ldef["name.tomorrow"]))
 
-def add_request(u, r):
-	if u not in requests:
-		requests[u] = []
-	requests[u].append(Req(u, r['date'], r['from'], r['dist']))
-	return requests[u][-1]
+confirm_markup = Km()
+confirm_markup.add(Kb(ldef["name.confirm"]), Kb(ldef["name.date"]), Kb(ldef["name.origin"]))
 
-def handle_date(t):
-	if t.lower() == 'today':
-		return datetime.now()
-	if t.lower() == 'tomorrow':
-		return datetime.now() + timedelta(days=1)
-	try:
-		return datetime.strptime(t, "%d.%m.%Y")
-	except:
-		return None
 
-def handle_confirm(t):
-	t = t.lower()
-	if t == 'confirm':
-		return True, None
-	if t == 'date':
-		return False, 'date'
-	if t == 'from':
-		return False, 'from'
-	if t == 'to':
-		return False, 'dist'
-	return False, None
+def build_to_request(u, r):
+    if u not in requests:
+        requests[u] = []
+    requests[u].append(r.req(u))
+    builds.pop(u)
+    return requests[u][-1]
 
-def msg_for_build(build):
-	return f'Your request:\nDate: {build["date"].strftime("%d.%m.%Y")}\nFrom: {build["from"]}\nTo: {build["dist"]}\nAll right or edit some field?'
 
-def step_get_date(msg):
-	bot.send_message(msg.chat.id, ldef["msg.date.question"], reply_markup=dates_markup)
-	bot.register_next_step_handler(msg, step_date)	
+def handle_date_answer(t):
+    if t.lower() == ldef["name.today"].lower():
+        return datetime.now()
+    if t.lower() == ldef["name.tomorrow"].lower():
+        return datetime.now() + timedelta(days=1)
+    try:
+        return datetime.strptime(t, "%d.%m.%Y")
+    except ValueError:
+        return None
 
-def step_get_from(msg):
-	bot.send_message(msg.chat.id, 'Now, select city your trip going from.', reply_markup=cities_markup)
-	bot.register_next_step_handler(msg, step_from)
 
-def step_get_dist(msg):
-	bot.send_message(msg.chat.id, 'Now, select city your trip going to.', reply_markup=cities_markup)
-	bot.register_next_step_handler(msg, step_dist)
+def handle_confirm_answer(t):
+    t = t.lower()
+    if t == ldef["name.confirm"].lower():
+        return True, None
+    if t == ldef["name.date"].lower():
+        return False, 'date'
+    if t == ldef["name.origin"].lower():
+        return False, 'origin'
+    return False, None
 
-def step_get_confirm(msg):
-	bot.send_message(msg.chat.id, msg_for_build(builds[msg.chat.id]), reply_markup=confirm_markup)
-	bot.register_next_step_handler(msg, step_confirm)
-
-def step_get_trips(msg, build):
-	req = add_request(msg.chat.id, build)
-	bot.send_message(msg.chat.id, f'Your request {req.cfrom} -> {req.dist} {req.sdate} added, wait for updates!')
 
 def next_step(msg, u):
-	if u not in builds or builds[u]['date'] is None:
-		step_get_date(msg)
-	elif builds[u]['from'] is None:
-		step_get_from(msg)
-	elif builds[u]['dist'] is None:
-		step_get_dist(msg)
-	else:
-		step_get_confirm(msg)
+    if u not in builds or builds[u].date is None:
+        step_get_date(msg)
+    elif builds[u].origin is None:
+        step_get_origin(msg)
+    else:
+        step_get_confirm(msg)
 
-def set_build(u, cfrom=None, dist=None, date=None):
-	if cfrom is None and dist is None and date is None:
-		return
-	if u not in builds:
-		builds[u] = {'date': date, 'from': cfrom, 'dist': dist}
-	else:
-		if cfrom is not None:
-			builds[u]['from'] = cfrom
-		if dist is not None:
-			builds[u]['dist'] = dist
-		if date is not None:
-			builds[u]['date'] = date
 
-def step_date(msg):	
-	d = handle_date(msg.text)
-	if d is None:
-		bot.send_message(msg.chat.id, ldef["msg.date.invalid"])
-		bot.register_next_step_handler(msg, step_date)	
-	else:	
-		bot.send_message(msg.chat.id, ldef["msg.date.selected"].format(d.strftime("%d.%m.%Y")))
-		set_build(msg.chat.id, date=d)
-		next_step(msg, msg.chat.id)
+def update_build(u, **kwargs):
+    if u not in builds:
+        builds[u] = Build()
+    builds[u].set(**kwargs)
 
-def step_from(msg):
-	bot.send_message(msg.chat.id, ldef["msg.origin.selected"].format(msg.text))
-	set_build(msg.chat.id, cfrom=msg.text)
-	next_step(msg, msg.chat.id)
 
-def step_dist(msg):
-	bot.send_message(msg.chat.id, ldef["msg.dist.selected"].fotmat(msg.text))
-	set_build(msg.chat.id, dist=msg.text)
-	next_step(msg, msg.chat.id)
+def confirmation_message_for_build(build):
+    return ldef["msg.confirm"].format(date=build.date.strftime("%d.%m.%Y"), origin=build.origin, dist=build.dist)
+
+
+def step_get_date(msg):
+    bot.send_message(msg.chat.id, ldef["msg.date.question"], reply_markup=dates_markup)
+    bot.register_next_step_handler(msg, step_date)
+
+
+def step_get_origin(msg):
+    bot.send_message(msg.chat.id, ldef["msg.origin.question"], reply_markup=origins_markup)
+    bot.register_next_step_handler(msg, step_origin)
+
+
+def step_get_confirm(msg):
+    bot.send_message(msg.chat.id, confirmation_message_for_build(builds[msg.chat.id]), reply_markup=confirm_markup)
+    bot.register_next_step_handler(msg, step_confirm)
+
+
+def step_add_request(msg, build):
+    req = build_to_request(msg.chat.id, build)
+    bot.send_message(msg.chat.id, ldef["msg.added.request"].format(route=req.route(), date=req.sdate))
+
+
+def step_date(msg):
+    d = handle_date_answer(msg.text)
+    if d is None:
+        bot.send_message(msg.chat.id, ldef["msg.date.invalid"])
+        bot.register_next_step_handler(msg, step_date)
+    else:
+        bot.send_message(msg.chat.id, ldef["msg.date.selected"].format(date=d.strftime("%d.%m.%Y")))
+        update_build(msg.chat.id, date=d)
+        next_step(msg, msg.chat.id)
+
+
+def step_origin(msg):
+    bot.send_message(msg.chat.id, ldef["msg.origin.selected"].format(origin=msg.text))
+    update_build(msg.chat.id, origin=msg.text)
+    next_step(msg, msg.chat.id)
+
 
 def step_confirm(msg):
-	confirmed, field = handle_confirm(msg.text)
-	if confirmed:
-		build = builds.pop(msg.chat.id)
-		step_get_trips(msg, build)
-	elif field is None:
-		bot.send_message(msg.chat.id,ldef["msg.answer.invalid"]) 
-		step_get_confirm(msg)
-	else:
-		builds[msg.chat.id][field] = None
-		next_step(msg, msg.chat.id)
+    confirmed, field = handle_confirm_answer(msg.text)
+    if confirmed:
+        step_add_request(msg, builds[msg.chat.id])
+    elif field is None:
+        bot.send_message(msg.chat.id, ldef["msg.answer.invalid"])
+        step_get_confirm(msg)
+    else:
+        update_build(msg.chat.id, **{field: None})
+        next_step(msg, msg.chat.id)
+
 
 @bot.message_handler(commands=['trips'])
 def on_message(msg):
-	next_step(msg,msg.chat.id)
+    next_step(msg, msg.chat.id)
 
-def run():	
-	bot.polling()
+
+def extract_dates(r):
+    return set([s.sdate for s in r])
+
+
+def request_trips_for_date(date):
+    res = rq.get("http://avto-slava.by/timetable/trips/", data={'date': date})
+    if res.status_code == 200:
+        return res.json()['data']['trips']
+    else:
+        return None
+
+
+def request_trips_for_dates(dates):
+    data_per_date = {}
+    for date in dates:
+        data = request_trips_for_date(date)
+        if data is None:
+            print('Failed to request data for', date)
+        data_per_date[date] = data
+    return data_per_date
+
+
+def message_for_compare_result(result):
+    res, old, new = result
+    if res == VariantCompareResult.NO_MORE_SEATS:
+        return ldef["msg.result.no_seats"].format(name=new.short_name())
+    elif res == VariantCompareResult.SEATS_SET_MORE:
+        return ldef["msg.result.seats_set_more"].format(name=new.short_name(), old_seats=old.seats, new_seats=new.seats, all_seats=new.all_seats)
+    elif res == VariantCompareResult.SEATS_SET_LESS:
+        return ldef["msg.result.seats_set_less"].format(name=new.short_name(), old_seats=old.seats, new_seats=new.seats, all_seats=new.all_seats)
+
+
+def invalidate_request(request):
+    messages = []
+    if request.data is not None:
+        if len(request.data.trips) > 0:
+            if request.cache is None:
+                variants = '\n'.join(request.data.to_message([], only_with_seats=True))
+                messages.append(f"{request.route()}\n{variants}")
+            else:
+                results = request.cache.compare(request.data)
+                messages += [message_for_compare_result(result) for result in results]
+
+        else:
+            messages.append(ldef["msg.result.no_trips"].format(route=request.route()))
+            requests[request.user].remove(request)
+    else:
+        messages.append(ldef["msg.result.error"].format(route=request.route()))
+    for message in messages:
+        bot.send_message(request.user, message)
+
+
+def loop_iteration():
+    if len(requests) > 0:
+        all_requests = [req for reqs in requests.values() for req in reqs]
+        data_per_date = request_trips_for_dates(extract_dates(all_requests))
+        for (user, reqs) in requests.items():
+            for request in reqs:
+                data = data_per_date[request.sdate]
+                request.cache = request.data
+                request.data = Trip(request.route(), data)
+                invalidate_request(request)
+
+
+def looper():
+    while True:
+        loop_iteration()
+        time.sleep(20)
+
+
+def run_request_handler(thread):
+    thread.start()
+
+
+def run(thread):
+    run_request_handler(thread)
+    bot.polling()
+
 
 if __name__ == '__main__':
-	run()
+    update_thread = Thread(target=looper)
+    run(update_thread)
